@@ -8,7 +8,6 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -22,13 +21,16 @@ jobs:
           - arch: x86_64
             neon: true
 
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-latest-arm64' || 'ubuntu-latest' }}
+
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Set up QEMU
-      if: matrix.arch == 'aarch64'
-      uses: docker/setup-qemu-action@v3
+    - name: Install Clang
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang
 
     - name: Install Xmake
       uses: xmake-io/github-action-setup-xmake@v1
@@ -52,7 +54,7 @@ jobs:
         DEFINES=$(echo "$DEFINES" | sed 's/^ *//')
 
         echo "Configuring with cxxflags: $DEFINES"
-        xmake f --mode=${{ matrix.mode }} --arch=${{ matrix.arch }} --cxxflags="$DEFINES" -y
+        xmake f --toolchain=llvm --mode=${{ matrix.mode }} --arch=${{ matrix.arch }} --cxxflags="$DEFINES" -y
 
     - name: Build all targets
       run: xmake build -vD -y
