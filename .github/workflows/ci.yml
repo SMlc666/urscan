@@ -52,13 +52,13 @@ jobs:
         DEFINES=$(echo "$DEFINES" | sed 's/^ *//')
 
         echo "Configuring with cxxflags: $DEFINES"
-        xmake f --mode=${{ matrix.mode }} --arch=${{ matrix.arch }} --cxxflags="$DEFINES"
+        xmake f --mode=${{ matrix.mode }} --arch=${{ matrix.arch }} --cxxflags="$DEFINES" -y
 
     - name: Build all targets
-      run: xmake build -vD
+      run: xmake build -vD -y
 
     - name: Run tests
-      run: xmake run tests
+      run: xmake run tests -y
 
     - name: Run benchmark
-      run: xmake run benchmark
+      run: xmake run benchmark -y
