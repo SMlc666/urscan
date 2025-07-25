@@ -1,0 +1,64 @@
+name: C++ CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [debug, release]
+        arch: [x86_64, aarch64]
+        multithread: [true, false]
+        prefetch: [true, false]
+        neon: [true, false]
+        exclude:
+          # NEON is only for ARM
+          - arch: x86_64
+            neon: true
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up QEMU
+      if: matrix.arch == 'aarch64'
+      uses: docker/setup-qemu-action@v3
+
+    - name: Install Xmake
+      uses: xmake-io/github-action-setup-xmake@v1
+      with:
+        xmake-version: latest
+
+    - name: Configure build
+      run: |
+        DEFINES=""
+        if [[ "${{ matrix.multithread }}" == "true" ]]; then
+          DEFINES="$DEFINES -DUR_ENABLE_MULTITHREADING"
+        fi
+        if [[ "${{ matrix.prefetch }}" == "true" ]]; then
+          DEFINES="$DEFINES -DUR_ENABLE_HARDWARE_PREFETCH"
+        fi
+        if [[ "${{ matrix.arch }}" == "aarch64" && "${{ matrix.neon }}" == "true" ]]; then
+          DEFINES="$DEFINES -DUR_ENABLE_NEON_OPTIMIZATION"
+        fi
+        
+        # Trim leading space if it exists
+        DEFINES=$(echo "$DEFINES" | sed 's/^ *//')
+
+        echo "Configuring with cxxflags: $DEFINES"
+        xmake f --mode=${{ matrix.mode }} --arch=${{ matrix.arch }} --cxxflags="$DEFINES"
+
+    - name: Build all targets
+      run: xmake build -vD
+
+    - name: Run tests
+      run: xmake run tests
+
+    - name: Run benchmark
+      run: xmake run benchmark

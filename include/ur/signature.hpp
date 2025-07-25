@@ -15,13 +15,13 @@
 #include <memory>
 
 // The UR_ENABLE_MULTITHREADING macro is the switch to enable/disable parallelism.
-#define UR_ENABLE_MULTITHREADING
+//#define UR_ENABLE_MULTITHREADING
 
 // The UR_ENABLE_NEON_OPTIMIZATION macro is the switch to enable/disable NEON SIMD acceleration.
-#define UR_ENABLE_NEON_OPTIMIZATION
+//#define UR_ENABLE_NEON_OPTIMIZATION
 
 // The UR_ENABLE_HARDWARE_PREFETCH macro is the switch to enable/disable hardware prefetching.
-#define UR_ENABLE_HARDWARE_PREFETCH
+//#define UR_ENABLE_HARDWARE_PREFETCH
 
 #ifdef UR_ENABLE_MULTITHREADING
 #include "thread_pool.hpp"
@@ -159,6 +159,10 @@ private:
                 break;
             }
 
+#ifdef UR_ENABLE_HARDWARE_PREFETCH
+            __builtin_prefetch(p, 0, 3);
+#endif
+
             if (memcmp(p, pattern_data, pattern_size) == 0) {
                 if (found_flag) {
                     found_flag->store(true, std::memory_order_relaxed);
@@ -178,6 +182,9 @@ private:
             if (!p) break;
             if (found_flag && found_flag->load(std::memory_order_relaxed)) return std::nullopt;
             if (static_cast<size_t>(scan_end - p) < pattern_.size()) break;
+#ifdef UR_ENABLE_HARDWARE_PREFETCH
+            __builtin_prefetch(p, 0, 3);
+#endif
             if (full_match_at(p)) {
                 if (found_flag) found_flag->store(true, std::memory_order_relaxed);
                 return reinterpret_cast<uintptr_t>(p);
@@ -200,6 +207,10 @@ private:
             if (potential_start < memory_range.data()) continue;
             if (static_cast<size_t>(scan_end - potential_start) < pattern_.size()) continue;
 
+#ifdef UR_ENABLE_HARDWARE_PREFETCH
+            __builtin_prefetch(potential_start, 0, 3);
+#endif
+
             if (full_match_at(potential_start)) {
                 if (found_flag) found_flag->store(true, std::memory_order_relaxed);
                 return reinterpret_cast<uintptr_t>(potential_start);
@@ -218,6 +229,9 @@ private:
             if (!p) break;
             if (found_flag && found_flag->load(std::memory_order_relaxed)) return std::nullopt;
             if (static_cast<size_t>(scan_end - p) < pattern_.size()) break;
+#ifdef UR_ENABLE_HARDWARE_PREFETCH
+            __builtin_prefetch(p, 0, 3);
+#endif
             if (p[last_byte_offset] == last_byte_ && full_match_at(p)) {
                 if (found_flag) found_flag->store(true, std::memory_order_relaxed);
                 return reinterpret_cast<uintptr_t>(p);
@@ -241,6 +255,9 @@ private:
             if (found_flag && found_flag->load(std::memory_order_relaxed)) return std::nullopt;
             const std::byte* potential_start = p - first_solid_offset;
             if (potential_start < memory_range.data() || static_cast<size_t>(scan_end - potential_start) < pattern_.size()) continue;
+#ifdef UR_ENABLE_HARDWARE_PREFETCH
+            __builtin_prefetch(potential_start, 0, 3);
+#endif
             if (full_match_at(potential_start)) {
                 if (found_flag) found_flag->store(true, std::memory_order_relaxed);
                 return reinterpret_cast<uintptr_t>(potential_start);
@@ -391,6 +408,9 @@ inline std::optional<uintptr_t> runtime_signature::scan_dynamic_anchor(std::span
     const std::byte* const fast_scan_end_pos = memory_range.data() + memory_range.size() - 16;
     while (current_pos <= fast_scan_end_pos) {
         if (found_flag && found_flag->load(std::memory_order_relaxed)) return std::nullopt;
+#ifdef UR_ENABLE_HARDWARE_PREFETCH
+        __builtin_prefetch(current_pos + 64, 0, 0);
+#endif
         const uint8x16_t v_mem = vld1q_u8(reinterpret_cast<const uint8_t*>(current_pos));
         const uint8x16_t v_cmp_result = vceqq_u8(v_mem, v_anchor);
         if (vmaxvq_u8(v_cmp_result) == 0) {
