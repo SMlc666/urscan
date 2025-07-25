@@ -2,16 +2,17 @@
 #include <vector>
 #include <string>
 #include <string_view>
-#include <sstream>
 #include <iomanip>
-#include <cstring> // For std::memcpy
+#include <cstring>
 #include <random>
+#include <memory>
+#include <type_traits>
 #include "ur/signature.hpp"
 #include "plf_nanotimer.h"
 
 // --- Utility Functions ---
 
-// A simple random data generator
+// Generates a buffer of random byte data.
 std::vector<std::byte> generate_random_data(size_t size) {
     std::vector<std::byte> data(size);
     std::mt19937 gen(std::random_device{}());
@@ -22,47 +23,25 @@ std::vector<std::byte> generate_random_data(size_t size) {
     return data;
 }
 
-// Generates a random signature string with a given length and wildcard ratio
-std::string generate_random_signature(size_t length, double wildcard_ratio, bool force_start_wildcard = false, bool force_end_solid = false) {
-    std::stringstream ss;
-    std::mt19937 gen(std::random_device{}());
-    std::uniform_real_distribution<> ratio_dist(0.0, 1.0);
-    std::uniform_int_distribution<> hex_dist(0, 255);
-
-    for (size_t i = 0; i < length; ++i) {
-        bool is_wildcard = ratio_dist(gen) < wildcard_ratio;
-        if (force_start_wildcard && i < length / 2) {
-            is_wildcard = true;
-        }
-        if (force_end_solid && i >= length - 2) { // Ensure last few bytes are solid
-            is_wildcard = false;
-        }
-
-        if (is_wildcard) {
-            ss << "?? ";
-        } else {
-            ss << std::hex << std::setw(2) << std::setfill('0') << hex_dist(gen) << " ";
-        }
-    }
-    return ss.str();
-}
-
 // Helper to convert a signature string to a byte vector for test data injection.
+// This version correctly handles wildcards for injection purposes.
 std::vector<std::byte> pattern_from_string(std::string_view s) {
     std::vector<std::byte> pattern;
-    pattern.reserve(s.length() / 3); // Approx.
+    pattern.reserve(s.length() / 3);
 
     auto hex_to_val = [](char c) -> uint8_t {
         if (c >= '0' && c <= '9') return c - '0';
         if (c >= 'a' && c <= 'f') return c - 'a' + 10;
         if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-        return 0;
+        return 0; // Should not happen with valid input
     };
 
     for (size_t i = 0; i < s.size(); ++i) {
         if (s[i] == ' ') continue;
         if (s[i] == '?') {
-            pattern.push_back(std::byte{0}); // Value doesn't matter for injection
+            // For data injection, we can't use a wildcard.
+            // We'll just use a placeholder byte. The signature will still use the wildcard.
+            pattern.push_back(std::byte{0x90}); // A common NOP instruction byte
             if (i + 1 < s.size() && s[i+1] == '?') i++;
         } else {
             if (i + 1 >= s.size()) break;
@@ -77,77 +56,82 @@ std::vector<std::byte> pattern_from_string(std::string_view s) {
 
 // --- Benchmark Core ---
 
-void run_benchmark(const std::string& test_name, size_t sig_length, double wildcard_ratio, bool force_start_wildcard, bool force_end_solid, std::vector<std::byte>& data_buffer) {
+void run_benchmark(const std::string& test_name, const std::string& signature_str, std::vector<std::byte>& data_buffer) {
     plf::nanotimer timer;
-    const int construction_runs = 100;
     const int scan_runs = 10;
 
-    std::cout << "\n--- " << test_name << " (Length: " << sig_length 
-              << ", Wildcard Ratio: " << std::fixed << std::setprecision(2) << wildcard_ratio << ") ---" << std::endl;
+    std::cout << "\n--- Benchmarking: " << test_name << " ---" << std::endl;
+    std::cout << "    Signature: " << signature_str << std::endl;
 
-    // 1. Generate a representative random signature for this config
-    std::string signature_str = generate_random_signature(sig_length, wildcard_ratio, force_start_wildcard, force_end_solid);
-    
-    // 2. Benchmark runtime_signature construction
-    double total_construction_time = 0;
-    for (int i = 0; i < construction_runs; ++i) {
-        std::string temp_sig_str = generate_random_signature(sig_length, wildcard_ratio, force_start_wildcard, force_end_solid);
-        timer.start();
-        volatile ur::runtime_signature sig(temp_sig_str);
-        total_construction_time += timer.get_elapsed_ns();
-    }
-    double avg_construction_time = total_construction_time / construction_runs;
-    std::cout << "Runtime Signature Construction (avg over " << construction_runs << " runs): " 
-              << avg_construction_time / 1000.0 << " us" << std::endl;
-
-    // 3. Benchmark runtime_signature scanning
+    // 1. Benchmark construction (less critical, but good to have)
+    timer.start();
     auto scan_sig = std::make_shared<ur::runtime_signature>(signature_str);
-    
+    double construction_time = timer.get_elapsed_ns();
+    std::cout << "    Construction Time: " << std::fixed << std::setprecision(3) << construction_time / 1000.0 << " us" << std::endl;
+
+    // 2. Prepare data buffer by injecting the pattern
     auto pattern_to_place = pattern_from_string(signature_str);
     if (data_buffer.size() > pattern_to_place.size()) {
-        size_t sig_pos = data_buffer.size() / 2;
-        std::memcpy(data_buffer.data() + sig_pos, pattern_to_place.data(), pattern_to_place.size());
+        // Place signature in the middle third of the buffer to ensure it's not at an edge
+        size_t offset = data_buffer.size() / 3 + (rand() % (data_buffer.size() / 3));
+        std::memcpy(data_buffer.data() + offset, pattern_to_place.data(), pattern_to_place.size());
     }
 
+    // 3. Benchmark scanning
     double total_scan_time = 0;
     for (int i = 0; i < scan_runs; ++i) {
         timer.start();
+        // The result is made volatile to prevent the compiler from optimizing the call away.
         volatile auto result = scan_sig->scan(data_buffer);
         total_scan_time += timer.get_elapsed_ns();
+        // Simple verification
+        if (!const_cast<std::remove_volatile_t<decltype(result)>&>(result).has_value() && i == 0) {
+             std::cerr << "Warning: Scan did not find the injected signature for test '" << test_name << "'." << std::endl;
+        }
     }
     double avg_scan_time = total_scan_time / scan_runs;
-    std::cout << "Runtime Signature Scan (avg over " << scan_runs << " runs):         " 
+    std::cout << "    Average Scan Time (over " << scan_runs << " runs): "
               << avg_scan_time / 1000.0 << " us" << std::endl;
 }
 
-void run_benchmark_for_size(size_t data_size) {
+void run_all_benchmarks_for_size(size_t data_size) {
     std::cout << "\n=========================================================" << std::endl;
     std::cout << "Benchmarking with " << data_size / (1024 * 1024) << " MB of data." << std::endl;
     std::cout << "=========================================================" << std::endl;
 
     auto data_buffer = generate_random_data(data_size);
 
-    // Define different signature characteristics to test
-    run_benchmark("Standard Test", 16, 0.10, false, false, data_buffer);
-    run_benchmark("Standard Test", 16, 0.50, false, false, data_buffer);
-    run_benchmark("Standard Test", 64, 0.10, false, false, data_buffer);
-    run_benchmark("Standard Test", 64, 0.50, false, false, data_buffer);
-    
-    // Add the special case for the user
-    run_benchmark("USER SPECIAL CASE", 32, 0.50, true, true, data_buffer);
+    // --- Define Representative Signatures for Each Strategy ---
+
+    // 1. Simple: No wildcards. Should be the fastest.
+    run_benchmark("Simple Strategy", "48 89 5C 24 08 57 48 83 EC 20", data_buffer);
+
+    // 2. Forward Anchor: Starts with solid bytes, ends with wildcards.
+    run_benchmark("Forward Anchor Strategy", "48 8B C4 48 89 58 08 48 89 70 10 48 89 78 18 41 56 ?? ?? ?? ??", data_buffer);
+
+    // 3. Backward Anchor: Starts with wildcards, ends with solid bytes.
+    run_benchmark("Backward Anchor Strategy", "?? ?? ?? ?? 48 8B C4 48 89 58 08 48 89 70 10 48 89 78 18 41 56", data_buffer);
+
+    // 4. Dual Anchor: Solid bytes at both ends, wildcards in the middle.
+    run_benchmark("Dual Anchor Strategy", "48 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 8B", data_buffer);
+
+    // 5. Dynamic Anchor: Wildcards at both ends, solid bytes in the middle.
+    run_benchmark("Dynamic Anchor Strategy", "?? ?? 48 8B C4 48 89 58 08 48 89 70 10 ?? ??", data_buffer);
 }
 
 int main() {
     try {
+        srand(time(0)); // Seed for random placement of signature
+
         std::vector<size_t> test_sizes = {
             1 * 1024 * 1024,    // 1 MB
             10 * 1024 * 1024,   // 10 MB
-            100 * 1024 * 1024,  // 100 MB
-            233 * 1024 * 1024   // 233 MB
+            50 * 1024 * 1024,   // 50 MB
+            100 * 1024 * 1024   // 100 MB
         };
 
         for (size_t size : test_sizes) {
-            run_benchmark_for_size(size);
+            run_all_benchmarks_for_size(size);
         }
 
     } catch (const std::exception& e) {

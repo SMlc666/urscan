@@ -277,6 +277,9 @@ public:
     }
 
     std::optional<uintptr_t> scan(std::span<const std::byte> memory_range) const {
+        if (pattern_.empty()) {
+            return std::nullopt;
+        }
         scanner_func_t scanner;
         switch (strategy_) {
             case detail::scan_strategy::simple:
