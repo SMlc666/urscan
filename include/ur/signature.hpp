@@ -12,6 +12,7 @@
 #include <limits>
 #include <numeric>
 #include <algorithm>
+#include <memory>
 
 // The UR_ENABLE_MULTITHREADING macro is the switch to enable/disable parallelism.
 #define UR_ENABLE_MULTITHREADING
@@ -70,9 +71,9 @@ namespace detail {
 #endif
 }
 
-class runtime_signature {
+class runtime_signature : public std::enable_shared_from_this<runtime_signature> {
 private:
-    using scanner_func_t = std::optional<uintptr_t> (runtime_signature::*)(std::span<const std::byte>, std::atomic<bool>*) const;
+    using scanner_func_t = std::optional<uintptr_t> (runtime_signature::*)(std::span<const std::byte>, std::shared_ptr<std::atomic<bool>>) const;
 
     std::vector<pattern_byte> pattern_;
     detail::scan_strategy strategy_ = detail::scan_strategy::simple;
@@ -124,7 +125,7 @@ private:
         return true;
     }
 
-    std::optional<uintptr_t> scan_simple(std::span<const std::byte> memory_range, std::atomic<bool>* found_flag) const {
+    std::optional<uintptr_t> scan_simple(std::span<const std::byte> memory_range, std::shared_ptr<std::atomic<bool>> found_flag) const {
         if (memory_range.size() < pattern_.size()) return std::nullopt;
         const auto scan_end = memory_range.data() + memory_range.size() - pattern_.size();
         
@@ -141,7 +142,7 @@ private:
         return std::nullopt;
     }
 
-    std::optional<uintptr_t> scan_forward_anchor(std::span<const std::byte> memory_range, std::atomic<bool>* found_flag) const {
+    std::optional<uintptr_t> scan_forward_anchor(std::span<const std::byte> memory_range, std::shared_ptr<std::atomic<bool>> found_flag) const {
         if (memory_range.size() < pattern_.size()) return std::nullopt;
         const auto scan_end = memory_range.data() + memory_range.size();
 
@@ -158,7 +159,7 @@ private:
         return std::nullopt;
     }
 
-    std::optional<uintptr_t> scan_backward_anchor(std::span<const std::byte> memory_range, std::atomic<bool>* found_flag) const {
+    std::optional<uintptr_t> scan_backward_anchor(std::span<const std::byte> memory_range, std::shared_ptr<std::atomic<bool>> found_flag) const {
         if (memory_range.size() < pattern_.size()) return std::nullopt;
         const auto scan_end = memory_range.data() + memory_range.size();
         const size_t last_byte_offset = pattern_.size() - 1;
@@ -180,7 +181,7 @@ private:
         return std::nullopt;
     }
 
-    std::optional<uintptr_t> scan_dual_anchor(std::span<const std::byte> memory_range, std::atomic<bool>* found_flag) const {
+    std::optional<uintptr_t> scan_dual_anchor(std::span<const std::byte> memory_range, std::shared_ptr<std::atomic<bool>> found_flag) const {
         if (memory_range.size() < pattern_.size()) return std::nullopt;
         const auto scan_end = memory_range.data() + memory_range.size();
         const size_t last_byte_offset = pattern_.size() - 1;
@@ -199,9 +200,9 @@ private:
     }
 
 #if defined(UR_ENABLE_NEON_OPTIMIZATION) && defined(__ARM_NEON)
-    std::optional<uintptr_t> scan_dynamic_anchor(std::span<const std::byte> memory_range, std::atomic<bool>* found_flag) const;
+    std::optional<uintptr_t> scan_dynamic_anchor(std::span<const std::byte> memory_range, std::shared_ptr<std::atomic<bool>> found_flag) const;
 #else
-    std::optional<uintptr_t> scan_dynamic_anchor(std::span<const std::byte> memory_range, std::atomic<bool>* found_flag) const {
+    std::optional<uintptr_t> scan_dynamic_anchor(std::span<const std::byte> memory_range, std::shared_ptr<std::atomic<bool>> found_flag) const {
         size_t first_solid_offset = 0;
         for(size_t i = 0; i < pattern_.size(); ++i) { if(!pattern_[i].is_wildcard) { first_solid_offset = i; break; } }
         if (memory_range.size() < pattern_.size()) return std::nullopt;
@@ -232,17 +233,17 @@ private:
         }
         auto& pool = get_pool();
         std::vector<std::future<std::optional<uintptr_t>>> futures;
-        std::atomic<bool> found_flag = false;
+        auto found_flag = std::make_shared<std::atomic<bool>>(false);
         const size_t overlap = pattern_.size() > 1 ? pattern_.size() - 1 : 0;
         for (size_t start = 0; start < memory_range.size(); start += chunk_size) {
             size_t end = std::min(start + chunk_size + overlap, memory_range.size());
             if (start >= end || (end - start) < pattern_.size()) continue;
             std::span<const std::byte> chunk = memory_range.subspan(start, end - start);
-            futures.push_back(pool.enqueue(core_scanner, this, chunk, &found_flag));
+            futures.push_back(pool.enqueue(core_scanner, shared_from_this(), chunk, found_flag));
         }
         for (auto& fut : futures) {
             if (auto result = fut.get(); result.has_value()) {
-                found_flag.store(true, std::memory_order_relaxed);
+                found_flag->store(true, std::memory_order_relaxed);
                 return result;
             }
         }
@@ -345,7 +346,7 @@ namespace detail {
     }
 }
 
-inline std::optional<uintptr_t> runtime_signature::scan_dynamic_anchor(std::span<const std::byte> memory_range, std::atomic<bool>* found_flag) const {
+inline std::optional<uintptr_t> runtime_signature::scan_dynamic_anchor(std::span<const std::byte> memory_range, std::shared_ptr<std::atomic<bool>> found_flag) const {
     if (memory_range.size() < pattern_.size()) return std::nullopt;
     auto frequencies = detail::calculate_dynamic_rarity(memory_range);
     auto props = detail::find_best_anchor_and_build_props(pattern_, frequencies);

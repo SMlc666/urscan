@@ -101,7 +101,7 @@ void run_benchmark(const std::string& test_name, size_t sig_length, double wildc
               << avg_construction_time / 1000.0 << " us" << std::endl;
 
     // 3. Benchmark runtime_signature scanning
-    ur::runtime_signature scan_sig(signature_str);
+    auto scan_sig = std::make_shared<ur::runtime_signature>(signature_str);
     
     auto pattern_to_place = pattern_from_string(signature_str);
     if (data_buffer.size() > pattern_to_place.size()) {
@@ -112,7 +112,7 @@ void run_benchmark(const std::string& test_name, size_t sig_length, double wildc
     double total_scan_time = 0;
     for (int i = 0; i < scan_runs; ++i) {
         timer.start();
-        volatile auto result = scan_sig.scan(data_buffer);
+        volatile auto result = scan_sig->scan(data_buffer);
         total_scan_time += timer.get_elapsed_ns();
     }
     double avg_scan_time = total_scan_time / scan_runs;
