@@ -78,10 +78,11 @@ private:
     std::vector<pattern_byte> pattern_;
     detail::scan_strategy strategy_ = detail::scan_strategy::simple;
     std::byte first_byte_{}, last_byte_{};
+    std::vector<std::byte> simple_pattern_;
 
     void analyze_pattern() {
         if (pattern_.empty()) {
-            strategy_ = detail::scan_strategy::simple;
+            strategy_ = detail::scan_strategy::simple; // Should ideally not be used, but as a fallback.
             return;
         }
 
@@ -93,15 +94,19 @@ private:
             }
         }
 
-        if (!has_wildcards) {
-            strategy_ = detail::scan_strategy::simple;
-            return;
-        }
-
         const bool starts_with_wildcard = pattern_.front().is_wildcard;
         const bool ends_with_wildcard = pattern_.back().is_wildcard;
 
-        if (!starts_with_wildcard && !ends_with_wildcard) {
+        if (!has_wildcards) {
+            // A pattern with no wildcards is a perfect candidate for dual_anchor.
+            strategy_ = detail::scan_strategy::dual_anchor;
+            first_byte_ = pattern_.front().value;
+            last_byte_ = pattern_.back().value;
+            // We still prepare simple_pattern_ for full_match_at if needed, or direct comparison.
+            simple_pattern_.resize(pattern_.size());
+            std::transform(pattern_.begin(), pattern_.end(), simple_pattern_.begin(), [](const auto& p){ return p.value; });
+
+        } else if (!starts_with_wildcard && !ends_with_wildcard) {
             strategy_ = detail::scan_strategy::dual_anchor;
             first_byte_ = pattern_.front().value;
             last_byte_ = pattern_.back().value;
@@ -117,6 +122,11 @@ private:
     }
 
     bool full_match_at(const std::byte* location) const {
+        // For dual_anchor with no wildcards, we can use a fast memcmp.
+        if (strategy_ == detail::scan_strategy::dual_anchor && !simple_pattern_.empty()) {
+             return memcmp(location, simple_pattern_.data(), simple_pattern_.size()) == 0;
+        }
+        // Fallback for patterns with wildcards.
         for (size_t i = 0; i < pattern_.size(); ++i) {
             if (!pattern_[i].is_wildcard && pattern_[i].value != location[i]) {
                 return false;
@@ -126,16 +136,33 @@ private:
     }
 
     std::optional<uintptr_t> scan_simple(std::span<const std::byte> memory_range, std::shared_ptr<std::atomic<bool>> found_flag) const {
-        if (memory_range.size() < pattern_.size()) return std::nullopt;
-        const auto scan_end = memory_range.data() + memory_range.size() - pattern_.size();
-        
-        std::vector<std::byte> pattern_bytes(pattern_.size());
-        std::transform(pattern_.begin(), pattern_.end(), pattern_bytes.begin(), [](const auto& p){ return p.value; });
+        if (memory_range.size() < simple_pattern_.size() || simple_pattern_.empty()) {
+            return std::nullopt;
+        }
 
-        for (const std::byte* p = memory_range.data(); p <= scan_end; ++p) {
-            if (found_flag && found_flag->load(std::memory_order_relaxed)) return std::nullopt;
-            if (memcmp(p, pattern_bytes.data(), pattern_.size()) == 0) {
-                if (found_flag) found_flag->store(true, std::memory_order_relaxed);
+        const auto scan_end = memory_range.data() + memory_range.size();
+        const std::byte first_byte = simple_pattern_.front();
+        const size_t pattern_size = simple_pattern_.size();
+        const std::byte* const pattern_data = simple_pattern_.data();
+
+        for (const std::byte* p = memory_range.data(); p < scan_end; ++p) {
+            p = static_cast<const std::byte*>(memchr(p, static_cast<int>(first_byte), scan_end - p));
+            if (!p) {
+                break;
+            }
+
+            if (found_flag && found_flag->load(std::memory_order_relaxed)) {
+                return std::nullopt;
+            }
+
+            if (static_cast<size_t>(scan_end - p) < pattern_size) {
+                break;
+            }
+
+            if (memcmp(p, pattern_data, pattern_size) == 0) {
+                if (found_flag) {
+                    found_flag->store(true, std::memory_order_relaxed);
+                }
                 return reinterpret_cast<uintptr_t>(p);
             }
         }
