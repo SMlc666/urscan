@@ -13,6 +13,7 @@
 #include <numeric>
 #include <algorithm>
 #include <memory>
+#include <atomic>
 
 // The UR_ENABLE_MULTITHREADING macro is the switch to enable/disable parallelism.
 //#define UR_ENABLE_MULTITHREADING
@@ -26,7 +27,6 @@
 #ifdef UR_ENABLE_MULTITHREADING
 #include "thread_pool.hpp"
 #include <future>
-#include <atomic>
 #endif
 
 #if defined(UR_ENABLE_NEON_OPTIMIZATION) && defined(__ARM_NEON)
