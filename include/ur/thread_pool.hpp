@@ -76,7 +76,7 @@ private:
 
 class ThreadPool {
 public:
-    ThreadPool(size_t threads = std::thread::hardware_concurrency()) : stop_(false) {
+    ThreadPool(size_t threads = std::thread::hardware_concurrency()) : stop_(false), active_threads_(0) {
         if (threads == 0) {
             threads = 1;
         }
@@ -116,7 +116,11 @@ public:
         size_t queue_idx = submission_idx_.fetch_add(1) % thread_count_;
         queues_[queue_idx].push([task]() { (*task)(); });
 
-        condition_.notify_one();
+        if (active_threads_ < thread_count_) {
+            condition_.notify_one();
+        } else {
+            condition_.notify_all();
+        }
         return res;
     }
 
@@ -127,9 +131,11 @@ private:
         while (!stop_.load()) {
             Task task;
             
+            active_threads_++;
             // First, try to pop a task from our own queue.
             if (queues_[id].pop(task)) {
                 task();
+                active_threads_--;
                 continue;
             }
 
@@ -142,6 +148,7 @@ private:
                     break;
                 }
             }
+            active_threads_--;
 
             if (stolen) {
                 task();
@@ -166,6 +173,7 @@ private:
 
     std::atomic<bool> stop_;
     std::atomic<size_t> submission_idx_{0};
+    std::atomic<size_t> active_threads_;
 
     std::mutex wait_mutex_;
     std::condition_variable condition_;
