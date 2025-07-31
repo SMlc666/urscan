@@ -136,6 +136,46 @@ TEST(SignatureTest, Constructor_IncompleteHex) {
     EXPECT_THROW(ur::runtime_signature sig("12 3"), std::invalid_argument);
 }
 
+// --- Tests for static_signature ---
+
+TEST(StaticSignatureTest, ForwardAnchor_Found) {
+    const std::vector<std::byte> pattern = {std::byte{0x48}, std::byte{0x8B}, std::byte{0x05}, std::byte{0xAA}};
+    auto memory = create_test_memory(512, pattern, 200);
+    auto result = ur::static_signature<"48 8B ?? AA">::scan(memory);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), reinterpret_cast<uintptr_t>(memory.data()) + 200);
+}
+
+TEST(StaticSignatureTest, BackwardAnchor_Found) {
+    const std::vector<std::byte> pattern = {std::byte{0xAA}, std::byte{0xBB}, std::byte{0xCC}, std::byte{0x8B}};
+    auto memory = create_test_memory(512, pattern, 300);
+    auto result = ur::static_signature<"?? BB CC 8B">::scan(memory);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), reinterpret_cast<uintptr_t>(memory.data()) + 300);
+}
+
+TEST(StaticSignatureTest, DualAnchor_Found) {
+    const std::vector<std::byte> pattern = {std::byte{0x48}, std::byte{0x12}, std::byte{0x34}, std::byte{0x8B}};
+    auto memory = create_test_memory(512, pattern, 50);
+    auto result = ur::static_signature<"48 ?? ?? 8B">::scan(memory);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), reinterpret_cast<uintptr_t>(memory.data()) + 50);
+}
+
+TEST(StaticSignatureTest, DynamicAnchor_Found) {
+    const std::vector<std::byte> pattern = {std::byte{0xAA}, std::byte{0x48}, std::byte{0x8B}, std::byte{0xBB}};
+    auto memory = create_test_memory(1024, pattern, 600);
+    auto result = ur::static_signature<"?? 48 8B ??">::scan(memory);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), reinterpret_cast<uintptr_t>(memory.data()) + 600);
+}
+
+TEST(StaticSignatureTest, NotFound) {
+    const std::vector<std::byte> memory(256, std::byte{0xAB});
+    auto result = ur::static_signature<"12 34 56">::scan(memory);
+    EXPECT_FALSE(result.has_value());
+}
+
 int main(int argc, char **argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

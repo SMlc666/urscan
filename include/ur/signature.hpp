@@ -79,6 +79,7 @@ private:
     detail::scan_strategy strategy_ = detail::scan_strategy::simple;
     std::byte first_byte_{}, last_byte_{};
     std::vector<std::byte> simple_pattern_;
+    std::array<size_t, 256> horspool_table_{};
 
     void analyze_pattern() {
         if (pattern_.empty()) {
@@ -98,14 +99,19 @@ private:
         const bool ends_with_wildcard = pattern_.back().is_wildcard;
 
         if (!has_wildcards) {
-            // A pattern with no wildcards is a perfect candidate for dual_anchor.
-            strategy_ = detail::scan_strategy::dual_anchor;
-            first_byte_ = pattern_.front().value;
-            last_byte_ = pattern_.back().value;
-            // We still prepare simple_pattern_ for full_match_at if needed, or direct comparison.
+            // A pattern with no wildcards is a perfect candidate for Boyer-Moore-Horspool.
+            strategy_ = detail::scan_strategy::simple;
             simple_pattern_.resize(pattern_.size());
             std::transform(pattern_.begin(), pattern_.end(), simple_pattern_.begin(), [](const auto& p){ return p.value; });
 
+            // BMH pre-calculation
+            const size_t pattern_len = simple_pattern_.size();
+            if (pattern_len > 0) {
+                horspool_table_.fill(pattern_len);
+                for (size_t i = 0; i < pattern_len - 1; ++i) {
+                    horspool_table_[static_cast<uint8_t>(simple_pattern_[i])] = pattern_len - 1 - i;
+                }
+            }
         } else if (!starts_with_wildcard && !ends_with_wildcard) {
             strategy_ = detail::scan_strategy::dual_anchor;
             first_byte_ = pattern_.front().value;
@@ -140,36 +146,34 @@ private:
             return std::nullopt;
         }
 
-        const auto scan_end = memory_range.data() + memory_range.size();
-        const std::byte first_byte = simple_pattern_.front();
-        const size_t pattern_size = simple_pattern_.size();
+        const size_t pattern_len = simple_pattern_.size();
+        const size_t scan_len = memory_range.size();
         const std::byte* const pattern_data = simple_pattern_.data();
+        const std::byte* const scan_data = memory_range.data();
+        const size_t last_pattern_idx = pattern_len - 1;
 
-        for (const std::byte* p = memory_range.data(); p < scan_end; ++p) {
-            p = static_cast<const std::byte*>(memchr(p, static_cast<int>(first_byte), scan_end - p));
-            if (!p) {
-                break;
-            }
-
+        size_t i = 0;
+        while (i <= scan_len - pattern_len) {
             if (found_flag && found_flag->load(std::memory_order_relaxed)) {
                 return std::nullopt;
             }
 
-            if (static_cast<size_t>(scan_end - p) < pattern_size) {
-                break;
-            }
-
 #ifdef UR_ENABLE_HARDWARE_PREFETCH
-            __builtin_prefetch(p, 0, 3);
+            __builtin_prefetch(scan_data + i, 0, 3);
 #endif
-
-            if (memcmp(p, pattern_data, pattern_size) == 0) {
-                if (found_flag) {
-                    found_flag->store(true, std::memory_order_relaxed);
+            
+            if (scan_data[i + last_pattern_idx] == pattern_data[last_pattern_idx]) {
+                if (pattern_len == 1 || memcmp(pattern_data, scan_data + i, last_pattern_idx) == 0) {
+                    if (found_flag) {
+                        found_flag->store(true, std::memory_order_relaxed);
+                    }
+                    return reinterpret_cast<uintptr_t>(scan_data + i);
                 }
-                return reinterpret_cast<uintptr_t>(p);
             }
+
+            i += horspool_table_[static_cast<uint8_t>(scan_data[i + last_pattern_idx])];
         }
+
         return std::nullopt;
     }
 
@@ -298,22 +302,39 @@ private:
 public:
     explicit runtime_signature(std::string_view s) {
         pattern_.reserve(s.length() / 2);
+        const char* p = s.data();
+        const char* end = p + s.size();
+
         auto hex_to_val = [](char c) -> std::uint8_t {
             if (c >= '0' && c <= '9') return c - '0';
             if (c >= 'a' && c <= 'f') return c - 'a' + 10;
             if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            // This function should not be called with invalid characters, but as a safeguard:
             throw std::invalid_argument("Invalid hexadecimal character.");
         };
-        for (size_t i = 0; i < s.size(); ++i) {
-            if (s[i] == ' ') continue;
-            if (s[i] == '?') {
+        
+        while (p < end) {
+            if (*p == ' ') {
+                p++;
+                continue;
+            }
+
+            if (*p == '?') {
                 pattern_.push_back({.is_wildcard = true});
-                if (i + 1 < s.size() && s[i+1] == '?') i++;
-            } else {
-                if (i + 1 >= s.size()) throw std::invalid_argument("Incomplete hex pair.");
-                std::uint8_t high = hex_to_val(s[i++]);
-                std::uint8_t low = hex_to_val(s[i]);
+                p++;
+                if (p < end && *p == '?') { // Handles the second '?' in a '??' pair
+                    p++;
+                }
+                continue;
+            }
+
+            if (isxdigit(static_cast<unsigned char>(p[0])) && (p + 1 < end) && isxdigit(static_cast<unsigned char>(p[1]))) {
+                std::uint8_t high = hex_to_val(p[0]);
+                std::uint8_t low = hex_to_val(p[1]);
                 pattern_.push_back({ .value = static_cast<std::byte>((high << 4) | low), .is_wildcard = false });
+                p += 2;
+            } else {
+                throw std::invalid_argument("Invalid pattern format: expected a hex pair or a wildcard.");
             }
         }
         pattern_.shrink_to_fit();
@@ -447,5 +468,191 @@ inline std::optional<uintptr_t> runtime_signature::scan_dynamic_anchor(std::span
     return std::nullopt;
 }
 #endif
+
+template <size_t N>
+struct fixed_string {
+    char data[N]{};
+    size_t size = N;
+    consteval fixed_string(const char(&str)[N]) {
+        std::copy_n(str, N, data);
+    }
+};
+
+template <fixed_string Signature>
+class static_signature {
+private:
+    static constexpr auto pattern_ = []() consteval {
+        std::array<pattern_byte, 256> p_bytes{};
+        size_t count = 0;
+        const char* p = Signature.data;
+        const char* end = p + Signature.size - 1;
+
+        auto hex_to_val = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        };
+        
+        while (p < end) {
+            if (*p == ' ') {
+                p++;
+                continue;
+            }
+
+            if (*p == '?') {
+                if (count >= 256) throw std::logic_error("Pattern exceeds maximum length of 256 bytes.");
+                p_bytes[count++] = {.is_wildcard = true};
+                p++;
+                if (p < end && *p == '?') {
+                    p++;
+                }
+                continue;
+            }
+
+            if (p + 1 < end) {
+                int high = hex_to_val(p[0]);
+                int low = hex_to_val(p[1]);
+                if (high != -1 && low != -1) {
+                    if (count >= 256) throw std::logic_error("Pattern exceeds maximum length of 256 bytes.");
+                    p_bytes[count++] = { .value = static_cast<std::byte>((high << 4) | low), .is_wildcard = false };
+                    p += 2;
+                } else {
+                    throw std::logic_error("Invalid hexadecimal character in pattern.");
+                }
+            } else {
+                 if (*p != '\0') { // Check for dangling character
+                    throw std::logic_error("Incomplete hex pair at the end of the pattern.");
+                }
+                break; // End of string
+            }
+        }
+        
+        std::array<pattern_byte, 256> final_pattern{};
+        for(size_t i = 0; i < count; ++i) final_pattern[i] = p_bytes[i];
+        
+        return std::pair(final_pattern, count);
+    }();
+
+    static constexpr size_t pattern_size_ = pattern_.second;
+    static constexpr auto pattern_data_ = pattern_.first;
+
+    static constexpr detail::scan_strategy strategy_ = []() consteval {
+        if (pattern_size_ == 0) return detail::scan_strategy::simple;
+
+        bool has_wildcards = false;
+        for(size_t i = 0; i < pattern_size_; ++i) {
+            if (pattern_data_[i].is_wildcard) {
+                has_wildcards = true;
+                break;
+            }
+        }
+
+        if (!has_wildcards) return detail::scan_strategy::simple;
+        if (!pattern_data_[0].is_wildcard && !pattern_data_[pattern_size_ - 1].is_wildcard) return detail::scan_strategy::dual_anchor;
+        if (!pattern_data_[0].is_wildcard) return detail::scan_strategy::forward_anchor;
+        if (!pattern_data_[pattern_size_ - 1].is_wildcard) return detail::scan_strategy::backward_anchor;
+        return detail::scan_strategy::dynamic_anchor;
+    }();
+
+    static constexpr std::array<size_t, 256> horspool_table_ = []() consteval {
+        std::array<size_t, 256> table{};
+        if constexpr (strategy_ == detail::scan_strategy::simple && pattern_size_ > 0) {
+            table.fill(pattern_size_);
+            for (size_t i = 0; i < pattern_size_ - 1; ++i) {
+                table[static_cast<uint8_t>(pattern_data_[i].value)] = pattern_size_ - 1 - i;
+            }
+        }
+        return table;
+    }();
+
+    static constexpr std::byte first_byte_ = (pattern_size_ > 0) ? pattern_data_[0].value : std::byte{0};
+    static constexpr std::byte last_byte_ = (pattern_size_ > 0) ? pattern_data_[pattern_size_ - 1].value : std::byte{0};
+
+    static constexpr bool full_match_at(const std::byte* location) {
+        if constexpr (strategy_ == detail::scan_strategy::simple) {
+            // For BMH, the last byte is already checked, so we compare the rest.
+            return memcmp(location, &pattern_data_[0].value, pattern_size_ - 1) == 0;
+        } else {
+            for (size_t i = 0; i < pattern_size_; ++i) {
+                if (!pattern_data_[i].is_wildcard && pattern_data_[i].value != location[i]) {
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+
+public:
+    static std::optional<uintptr_t> scan(std::span<const std::byte> memory_range) {
+        if (pattern_size_ == 0 || memory_range.size() < pattern_size_) {
+            return std::nullopt;
+        }
+
+        const auto scan_end = memory_range.data() + memory_range.size();
+        const auto scan_data = memory_range.data();
+        const auto scan_len = memory_range.size();
+
+        if constexpr (strategy_ == detail::scan_strategy::simple) {
+            const size_t last_pattern_idx = pattern_size_ - 1;
+            size_t i = 0;
+            while (i <= scan_len - pattern_size_) {
+                const std::byte last_byte = scan_data[i + last_pattern_idx];
+                if (last_byte == last_byte_) {
+                    if (pattern_size_ == 1 || full_match_at(scan_data + i)) {
+                        return reinterpret_cast<uintptr_t>(scan_data + i);
+                    }
+                }
+                i += horspool_table_[static_cast<uint8_t>(last_byte)];
+            }
+        } else if constexpr (strategy_ == detail::scan_strategy::forward_anchor || strategy_ == detail::scan_strategy::dual_anchor) {
+            for (const std::byte* p = memory_range.data(); p < scan_end; ++p) {
+                p = static_cast<const std::byte*>(memchr(p, static_cast<int>(first_byte_), scan_end - p));
+                if (!p) break;
+                if (static_cast<size_t>(scan_end - p) < pattern_size_) break;
+                
+                if constexpr (strategy_ == detail::scan_strategy::dual_anchor) {
+                    if (p[pattern_size_ - 1] != last_byte_) continue;
+                }
+
+                if (full_match_at(p)) {
+                    return reinterpret_cast<uintptr_t>(p);
+                }
+            }
+        } else if constexpr (strategy_ == detail::scan_strategy::backward_anchor) {
+            const size_t last_byte_offset = pattern_size_ - 1;
+            for (const std::byte* p = memory_range.data(); p < scan_end; ++p) {
+                p = static_cast<const std::byte*>(memchr(p, static_cast<int>(last_byte_), scan_end - p));
+                if (!p) break;
+                
+                const std::byte* potential_start = p - last_byte_offset;
+                if (potential_start < memory_range.data()) continue;
+                if (static_cast<size_t>(scan_end - potential_start) < pattern_size_) continue;
+
+                if (full_match_at(potential_start)) {
+                    return reinterpret_cast<uintptr_t>(potential_start);
+                }
+            }
+        } else { // dynamic_anchor
+            size_t first_solid_offset = 0;
+            for(size_t i = 0; i < pattern_size_; ++i) { if(!pattern_data_[i].is_wildcard) { first_solid_offset = i; break; } }
+            const std::byte anchor = pattern_data_[first_solid_offset].value;
+
+            for (const std::byte* p = memory_range.data(); p < scan_end; ++p) {
+                p = static_cast<const std::byte*>(memchr(p, static_cast<int>(anchor), scan_end - p));
+                if (!p) break;
+                
+                const std::byte* potential_start = p - first_solid_offset;
+                if (potential_start < memory_range.data() || static_cast<size_t>(scan_end - potential_start) < pattern_size_) continue;
+
+                if (full_match_at(potential_start)) {
+                    return reinterpret_cast<uintptr_t>(potential_start);
+                }
+            }
+        }
+
+        return std::nullopt;
+    }
+};
 
 } // namespace ur

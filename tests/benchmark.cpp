@@ -191,6 +191,44 @@ void run_all_benchmarks_for_size(size_t data_size, std::mt19937& gen) {
     }
 }
 
+void run_frequent_first_byte_benchmark(size_t data_size, std::mt19937& gen) {
+    std::cout << "\n=========================================================" << std::endl;
+    std::cout << "Benchmarking with frequent first byte (" << data_size / (1024 * 1024) << " MB data)" << std::endl;
+    std::cout << "=========================================================" << std::endl;
+
+    // 1. Define the frequent byte
+    const std::byte frequent_byte{0xAA};
+    const std::string frequent_byte_str = "AA";
+
+    // 2. Create the data buffer and fill it with a high percentage of the frequent byte
+    auto data_buffer = generate_random_data(data_size, gen);
+    // Overwrite a large portion of the buffer with the frequent byte
+    std::fill(data_buffer.begin(), data_buffer.begin() + data_size / 2, frequent_byte);
+    // Shuffle to distribute the frequent byte somewhat randomly
+    std::shuffle(data_buffer.begin(), data_buffer.end(), gen);
+    std::cout << "    Generated data with a high frequency of '" << frequent_byte_str << "'." << std::endl;
+
+    // 3. Create a signature starting with the frequent byte
+    const size_t signature_length = 20;
+    std::string signature_suffix = generate_random_hex(signature_length - 1, gen);
+    std::string signature_str = frequent_byte_str + " " + signature_suffix;
+    auto pattern_bytes = pattern_from_string(signature_str);
+
+    // 4. Inject signature and get address
+    uintptr_t expected_address = 0;
+    if (data_buffer.size() >= pattern_bytes.size()) {
+        size_t offset = data_buffer.size() / 3; // Place somewhere in the latter 2/3
+        std::memcpy(data_buffer.data() + offset, pattern_bytes.data(), pattern_bytes.size());
+        expected_address = reinterpret_cast<uintptr_t>(data_buffer.data() + offset);
+    }
+
+    std::cout << "    Injected Signature: " << signature_str << std::endl;
+    std::cout << "    Expected Address: " << reinterpret_cast<const void*>(expected_address) << std::endl;
+
+    // 5. Run the benchmark. This signature will use the "Forward Anchor" strategy.
+    run_benchmark("Frequent First Byte (Forward Anchor)", signature_str, data_buffer, expected_address);
+}
+
 int main() {
     try {
         // Use a single, seeded random generator for the whole benchmark suite
@@ -206,6 +244,7 @@ int main() {
 
         for (size_t size : test_sizes) {
             run_all_benchmarks_for_size(size, gen);
+            run_frequent_first_byte_benchmark(size, gen);
         }
 
     } catch (const std::exception& e) {
