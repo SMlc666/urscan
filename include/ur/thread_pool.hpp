@@ -112,11 +112,13 @@ public:
             throw std::runtime_error("enqueue on stopped ThreadPool");
         }
 
+        tasks_in_flight_.fetch_add(1);
+
         // Distribute tasks to worker queues round-robin
         size_t queue_idx = submission_idx_.fetch_add(1) % thread_count_;
         queues_[queue_idx].push([task]() { (*task)(); });
 
-        condition_.notify_all();
+        condition_.notify_one();
         return res;
     }
 
@@ -129,6 +131,7 @@ private:
             
             // First, try to pop a task from our own queue.
             if (queues_[id].pop(task)) {
+                tasks_in_flight_.fetch_sub(1);
                 task();
                 continue;
             }
@@ -137,6 +140,7 @@ private:
             bool stolen = false;
             for (size_t i = 1; i < thread_count_; ++i) {
                 if (queues_[(id + i) % thread_count_].steal(task)) {
+                    tasks_in_flight_.fetch_sub(1);
                     stolen = true;
                     break;
                 }
@@ -148,12 +152,7 @@ private:
                 // If no task was found, wait for a notification.
                 std::unique_lock<std::mutex> lock(wait_mutex_);
                 condition_.wait(lock, [this] {
-                    if (stop_.load()) return true;
-                    // Wake up if any queue has tasks. This prevents missed notifications.
-                    for (size_t i = 0; i < thread_count_; ++i) {
-                        if (!queues_[i].empty()) return true;
-                    }
-                    return false;
+                    return stop_.load() || tasks_in_flight_.load() > 0;
                 });
             }
         }
@@ -165,6 +164,7 @@ private:
 
     std::atomic<bool> stop_;
     std::atomic<size_t> submission_idx_{0};
+    std::atomic<size_t> tasks_in_flight_{0};
 
     std::mutex wait_mutex_;
     std::condition_variable condition_;
