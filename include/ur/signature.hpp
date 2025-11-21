@@ -73,7 +73,7 @@ namespace detail {
 #endif
 }
 
-class runtime_signature : public std::enable_shared_from_this<runtime_signature> {
+class runtime_signature {
 private:
     using scanner_func_t = std::optional<uintptr_t> (runtime_signature::*)(std::span<const std::byte>, std::shared_ptr<std::atomic<bool>>) const;
 
@@ -310,7 +310,7 @@ private:
             if (start >= end || (end - start) < pattern_.size()) continue;
             
             std::span<const std::byte> chunk = memory_range.subspan(start, end - start);
-            futures.push_back(pool.enqueue(core_scanner, shared_from_this(), chunk, found_flag));
+            futures.push_back(pool.enqueue(core_scanner, this, chunk, found_flag));
         }
 
         std::optional<uintptr_t> first_result;
@@ -359,7 +359,7 @@ private:
 
             // If the range is small enough, treat as single task
             if (len <= chunk_size * 2) {
-                 futures.push_back(pool.enqueue(core_scanner, shared_from_this(), mem_span, found_flag));
+                 futures.push_back(pool.enqueue(core_scanner, this, mem_span, found_flag));
             } else {
                  // Chunk large ranges
                  for (size_t i = 0; i < len; i += chunk_size) {
@@ -367,7 +367,7 @@ private:
                     size_t end = std::min(i + chunk_size + overlap, len);
                     if (i >= end || (end - i) < pattern_.size()) continue;
                     
-                    futures.push_back(pool.enqueue(core_scanner, shared_from_this(), mem_span.subspan(i, end - i), found_flag));
+                    futures.push_back(pool.enqueue(core_scanner, this, mem_span.subspan(i, end - i), found_flag));
                  }
             }
         }
