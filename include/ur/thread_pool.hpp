@@ -138,15 +138,35 @@ private:
 
             // If our queue is empty, try to steal a task from another thread.
             bool stolen = false;
-            for (size_t i = 1; i < thread_count_; ++i) {
-                if (queues_[(id + i) % thread_count_].steal(task)) {
-                    tasks_in_flight_.fetch_sub(1);
-                    stolen = true;
-                    break;
-                }
+            size_t steal_idx = id + 1;
+            if (steal_idx >= thread_count_) steal_idx = 0;
+            size_t attempts = thread_count_ - 1;
+
+            while (attempts >= 4) {
+                if (queues_[steal_idx].steal(task)) { stolen = true; goto found; }
+                steal_idx++; if (steal_idx >= thread_count_) steal_idx = 0;
+
+                if (queues_[steal_idx].steal(task)) { stolen = true; goto found; }
+                steal_idx++; if (steal_idx >= thread_count_) steal_idx = 0;
+
+                if (queues_[steal_idx].steal(task)) { stolen = true; goto found; }
+                steal_idx++; if (steal_idx >= thread_count_) steal_idx = 0;
+
+                if (queues_[steal_idx].steal(task)) { stolen = true; goto found; }
+                steal_idx++; if (steal_idx >= thread_count_) steal_idx = 0;
+
+                attempts -= 4;
             }
 
+            while (attempts > 0) {
+                if (queues_[steal_idx].steal(task)) { stolen = true; goto found; }
+                steal_idx++; if (steal_idx >= thread_count_) steal_idx = 0;
+                attempts--;
+            }
+
+        found:
             if (stolen) {
+                tasks_in_flight_.fetch_sub(1);
                 task();
             } else {
                 // If no task was found, wait for a notification.

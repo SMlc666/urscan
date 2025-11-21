@@ -14,6 +14,8 @@
 #include <algorithm>
 #include <memory>
 #include <atomic>
+#include <utility>
+#include <bit>
 
 // The UR_ENABLE_MULTITHREADING macro is the switch to enable/disable parallelism.
 //#define UR_ENABLE_MULTITHREADING
@@ -133,8 +135,22 @@ private:
              return memcmp(location, simple_pattern_.data(), simple_pattern_.size()) == 0;
         }
         // Fallback for patterns with wildcards.
-        for (size_t i = 0; i < pattern_.size(); ++i) {
-            if (!pattern_[i].is_wildcard && pattern_[i].value != location[i]) {
+        size_t i = 0;
+        const size_t size = pattern_.size();
+        const pattern_byte* p_data = pattern_.data();
+        
+        // Aggressive unrolling (4 bytes per iteration)
+        for (; i + 4 <= size; i += 4) {
+            if ((!p_data[i].is_wildcard && p_data[i].value != location[i]) ||
+                (!p_data[i+1].is_wildcard && p_data[i+1].value != location[i+1]) ||
+                (!p_data[i+2].is_wildcard && p_data[i+2].value != location[i+2]) ||
+                (!p_data[i+3].is_wildcard && p_data[i+3].value != location[i+3])) {
+                return false;
+            }
+        }
+
+        for (; i < size; ++i) {
+            if (!p_data[i].is_wildcard && p_data[i].value != location[i]) {
                 return false;
             }
         }
@@ -308,6 +324,65 @@ private:
         
         return first_result;
     }
+
+    std::optional<uintptr_t> scan_ranges_multithreaded(const std::vector<std::pair<const void*, const void*>>& ranges, scanner_func_t core_scanner) const {
+        const unsigned int num_threads = std::thread::hardware_concurrency();
+        if (num_threads <= 1 || ranges.empty()) {
+            for (const auto& range : ranges) {
+                const std::byte* start = static_cast<const std::byte*>(range.first);
+                const std::byte* end = static_cast<const std::byte*>(range.second);
+                if (start >= end) continue;
+                auto res = (this->*core_scanner)(std::span<const std::byte>(start, end - start), nullptr);
+                if (res) return res;
+            }
+            return std::nullopt;
+        }
+
+        auto& pool = get_pool();
+        std::vector<std::future<std::optional<uintptr_t>>> futures;
+        auto found_flag = std::make_shared<std::atomic<bool>>(false);
+        
+        const size_t chunk_size = 65536 * 4;
+        const size_t overlap = pattern_.size() > 1 ? pattern_.size() - 1 : 0;
+
+        for (const auto& range : ranges) {
+            if (found_flag->load(std::memory_order_acquire)) break;
+            
+            const std::byte* start_ptr = static_cast<const std::byte*>(range.first);
+            const std::byte* end_ptr = static_cast<const std::byte*>(range.second);
+            if (start_ptr >= end_ptr) continue;
+            
+            size_t len = end_ptr - start_ptr;
+            if (len < pattern_.size()) continue;
+            
+            std::span<const std::byte> mem_span(start_ptr, len);
+
+            // If the range is small enough, treat as single task
+            if (len <= chunk_size * 2) {
+                 futures.push_back(pool.enqueue(core_scanner, shared_from_this(), mem_span, found_flag));
+            } else {
+                 // Chunk large ranges
+                 for (size_t i = 0; i < len; i += chunk_size) {
+                    if (found_flag->load(std::memory_order_acquire)) break;
+                    size_t end = std::min(i + chunk_size + overlap, len);
+                    if (i >= end || (end - i) < pattern_.size()) continue;
+                    
+                    futures.push_back(pool.enqueue(core_scanner, shared_from_this(), mem_span.subspan(i, end - i), found_flag));
+                 }
+            }
+        }
+
+        std::optional<uintptr_t> first_result;
+        for (auto& fut : futures) {
+            if (auto result = fut.get(); result.has_value()) {
+                if (!first_result.has_value() || result.value() < first_result.value()) {
+                    first_result = result;
+                }
+            }
+        }
+        
+        return first_result;
+    }
 #endif
 
 public:
@@ -381,6 +456,43 @@ public:
         return (this->*scanner)(memory_range, nullptr);
 #endif
     }
+
+    std::optional<uintptr_t> scan(const std::vector<std::pair<const void*, const void*>>& ranges) const {
+        if (pattern_.empty() || ranges.empty()) {
+            return std::nullopt;
+        }
+        scanner_func_t scanner;
+        switch (strategy_) {
+            case detail::scan_strategy::simple:
+                scanner = &runtime_signature::scan_simple;
+                break;
+            case detail::scan_strategy::forward_anchor:
+                scanner = &runtime_signature::scan_forward_anchor;
+                break;
+            case detail::scan_strategy::backward_anchor:
+                scanner = &runtime_signature::scan_backward_anchor;
+                break;
+            case detail::scan_strategy::dual_anchor:
+                scanner = &runtime_signature::scan_dual_anchor;
+                break;
+            case detail::scan_strategy::dynamic_anchor:
+            default:
+                scanner = &runtime_signature::scan_dynamic_anchor;
+                break;
+        }
+#ifdef UR_ENABLE_MULTITHREADING
+        return scan_ranges_multithreaded(ranges, scanner);
+#else
+        for (const auto& range : ranges) {
+             const std::byte* start = static_cast<const std::byte*>(range.first);
+             const std::byte* end = static_cast<const std::byte*>(range.second);
+             if (start >= end) continue;
+             auto res = (this->*scanner)(std::span<const std::byte>(start, end - start), nullptr);
+             if (res) return res;
+        }
+        return std::nullopt;
+#endif
+    }
 };
 
 #if defined(UR_ENABLE_NEON_OPTIMIZATION) && defined(__ARM_NEON)
@@ -389,7 +501,22 @@ namespace detail {
         std::array<uint32_t, 256> frequencies{};
         constexpr size_t sample_stride = 4096;
         if (memory_range.size() < sample_stride) {
-            for (const auto& byte : memory_range) frequencies[static_cast<uint8_t>(byte)]++;
+            const size_t size = memory_range.size();
+            const std::byte* data = memory_range.data();
+            size_t i = 0;
+            for (; i + 8 <= size; i += 8) {
+                frequencies[static_cast<uint8_t>(data[i])]++;
+                frequencies[static_cast<uint8_t>(data[i+1])]++;
+                frequencies[static_cast<uint8_t>(data[i+2])]++;
+                frequencies[static_cast<uint8_t>(data[i+3])]++;
+                frequencies[static_cast<uint8_t>(data[i+4])]++;
+                frequencies[static_cast<uint8_t>(data[i+5])]++;
+                frequencies[static_cast<uint8_t>(data[i+6])]++;
+                frequencies[static_cast<uint8_t>(data[i+7])]++;
+            }
+            for (; i < size; ++i) {
+                frequencies[static_cast<uint8_t>(data[i])]++;
+            }
         } else {
             for (size_t i = 0; i < memory_range.size(); i += sample_stride) {
                 frequencies[static_cast<uint8_t>(memory_range[i])]++;
@@ -442,6 +569,79 @@ inline std::optional<uintptr_t> runtime_signature::scan_dynamic_anchor(std::span
     const std::byte* const range_end = memory_range.data() + memory_range.size();
     const std::byte* const end_pos = range_end - pattern_.size();
     const std::byte* const fast_scan_end_pos = (range_end >= memory_range.data() + 16) ? range_end - 16 : memory_range.data();
+    const std::byte* const fast_scan_end_pos_64 = (range_end >= memory_range.data() + 64) ? range_end - 64 : memory_range.data();
+
+    auto check_block = [&](const std::byte* pos, uint8x16_t cmp_res) -> std::optional<uintptr_t> {
+        if (vmaxvq_u8(cmp_res) == 0) return std::nullopt;
+
+        const uint8x8_t packed = vshrn_n_u16(vreinterpretq_u16_u8(cmp_res), 4);
+        uint64_t mask = vget_lane_u64(vreinterpret_u64_u8(packed), 0);
+
+        while (mask != 0) {
+            const int bit_pos = std::countr_zero(mask);
+            const int i = bit_pos >> 2;
+
+            // Clear the processed nibble
+            mask &= ~(0xFULL << bit_pos);
+
+            const std::byte* potential_start = pos + i - props.anchor_offset;
+            if (potential_start < memory_range.data() || potential_start > end_pos) continue;
+
+            if (potential_start + 16 <= range_end) {
+                const uint8x16_t v_mem16 = vld1q_u8(reinterpret_cast<const uint8_t*>(potential_start));
+                const uint8x16_t v_masked_mem = vandq_u8(v_mem16, v_mask16);
+                const uint8x16_t v_verify_result = vceqq_u8(v_masked_mem, v_pattern16);
+
+                if (vminvq_u8(v_verify_result) == 0xFF) {
+                    if (pattern_.size() <= 16 || full_match_at(potential_start)) {
+                        if (found_flag) found_flag->store(true, std::memory_order_release);
+                        return reinterpret_cast<uintptr_t>(potential_start);
+                    }
+                }
+            } else {
+                if (full_match_at(potential_start)) {
+                    if (found_flag) found_flag->store(true, std::memory_order_release);
+                    return reinterpret_cast<uintptr_t>(potential_start);
+                }
+            }
+        }
+        return std::nullopt;
+    };
+
+    // Aggressive unrolling: process 64 bytes at a time
+    while (current_pos <= fast_scan_end_pos_64) {
+        if (found_flag && found_flag->load(std::memory_order_acquire)) return std::nullopt;
+
+#ifdef UR_ENABLE_HARDWARE_PREFETCH
+        __builtin_prefetch(current_pos + 128, 0, 0);
+#endif
+
+        const uint8x16_t v_mem0 = vld1q_u8(reinterpret_cast<const uint8_t*>(current_pos));
+        const uint8x16_t v_mem1 = vld1q_u8(reinterpret_cast<const uint8_t*>(current_pos + 16));
+        const uint8x16_t v_mem2 = vld1q_u8(reinterpret_cast<const uint8_t*>(current_pos + 32));
+        const uint8x16_t v_mem3 = vld1q_u8(reinterpret_cast<const uint8_t*>(current_pos + 48));
+
+        const uint8x16_t v_cmp0 = vceqq_u8(v_mem0, v_anchor);
+        const uint8x16_t v_cmp1 = vceqq_u8(v_mem1, v_anchor);
+        const uint8x16_t v_cmp2 = vceqq_u8(v_mem2, v_anchor);
+        const uint8x16_t v_cmp3 = vceqq_u8(v_mem3, v_anchor);
+
+        // Fast check: if no anchor is found in any of the 4 blocks, skip 64 bytes
+        const uint8x16_t v_any = vorrq_u8(vorrq_u8(v_cmp0, v_cmp1), vorrq_u8(v_cmp2, v_cmp3));
+        if (vmaxvq_u8(v_any) == 0) {
+            current_pos += 64;
+            continue;
+        }
+
+        if (auto res = check_block(current_pos, v_cmp0)) return res;
+        current_pos += 16;
+        if (auto res = check_block(current_pos, v_cmp1)) return res;
+        current_pos += 16;
+        if (auto res = check_block(current_pos, v_cmp2)) return res;
+        current_pos += 16;
+        if (auto res = check_block(current_pos, v_cmp3)) return res;
+        current_pos += 16;
+    }
 
     while (current_pos <= fast_scan_end_pos) {
         if (found_flag && found_flag->load(std::memory_order_acquire)) return std::nullopt;
@@ -452,38 +652,7 @@ inline std::optional<uintptr_t> runtime_signature::scan_dynamic_anchor(std::span
         const uint8x16_t v_mem = vld1q_u8(reinterpret_cast<const uint8_t*>(current_pos));
         const uint8x16_t v_cmp_result = vceqq_u8(v_mem, v_anchor);
 
-        if (vmaxvq_u8(v_cmp_result) == 0) {
-            current_pos += 16;
-            continue;
-        }
-
-        uint8_t result_bytes[16];
-        vst1q_u8(result_bytes, v_cmp_result);
-        for (int i = 0; i < 16; ++i) {
-            if (result_bytes[i] == 0xFF) {
-                const std::byte* potential_start = current_pos + i - props.anchor_offset;
-                if (potential_start < memory_range.data() || potential_start > end_pos) continue;
-                if (potential_start + pattern_.size() > range_end) continue;
-
-                if (potential_start + 16 <= range_end) {
-                    const uint8x16_t v_mem16 = vld1q_u8(reinterpret_cast<const uint8_t*>(potential_start));
-                    const uint8x16_t v_masked_mem = vandq_u8(v_mem16, v_mask16);
-                    const uint8x16_t v_verify_result = vceqq_u8(v_masked_mem, v_pattern16);
-                    
-                    if (vminvq_u8(v_verify_result) == 0xFF) {
-                        if (pattern_.size() <= 16 || full_match_at(potential_start)) {
-                            if (found_flag) found_flag->store(true, std::memory_order_release);
-                            return reinterpret_cast<uintptr_t>(potential_start);
-                        }
-                    }
-                } else {
-                    if (full_match_at(potential_start)) {
-                        if (found_flag) found_flag->store(true, std::memory_order_release);
-                        return reinterpret_cast<uintptr_t>(potential_start);
-                    }
-                }
-            }
-        }
+        if (auto res = check_block(current_pos, v_cmp_result)) return res;
         current_pos += 16;
     }
 
@@ -601,17 +770,17 @@ private:
     static constexpr std::byte first_byte_ = (pattern_size_ > 0) ? pattern_data_[0].value : std::byte{0};
     static constexpr std::byte last_byte_ = (pattern_size_ > 0) ? pattern_data_[pattern_size_ - 1].value : std::byte{0};
 
+    template <size_t... Is>
+    static constexpr bool full_match_at_impl(const std::byte* location, std::index_sequence<Is...>) {
+        return ((pattern_data_[Is].is_wildcard || pattern_data_[Is].value == location[Is]) && ...);
+    }
+
     static constexpr bool full_match_at(const std::byte* location) {
         if constexpr (strategy_ == detail::scan_strategy::simple) {
             // For BMH, the last byte is already checked, so we compare the rest.
             return memcmp(location, &pattern_data_[0].value, pattern_size_ - 1) == 0;
         } else {
-            for (size_t i = 0; i < pattern_size_; ++i) {
-                if (!pattern_data_[i].is_wildcard && pattern_data_[i].value != location[i]) {
-                    return false;
-                }
-            }
-            return true;
+            return full_match_at_impl(location, std::make_index_sequence<pattern_size_>{});
         }
     }
 

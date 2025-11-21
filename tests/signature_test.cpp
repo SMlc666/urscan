@@ -136,6 +136,43 @@ TEST(SignatureTest, Constructor_IncompleteHex) {
     EXPECT_THROW(ur::runtime_signature sig("12 3"), std::invalid_argument);
 }
 
+TEST(SignatureTest, ScanMultipleRanges_Found) {
+    ur::runtime_signature sig("12 34 56");
+    
+    std::vector<std::byte> block1(100, std::byte{0x00});
+    std::vector<std::byte> block2 = create_test_memory(200, {std::byte{0x12}, std::byte{0x34}, std::byte{0x56}}, 50);
+    std::vector<std::byte> block3(100, std::byte{0x00});
+    
+    std::vector<std::pair<const void*, const void*>> ranges;
+    ranges.push_back({block1.data(), block1.data() + block1.size()});
+    ranges.push_back({block2.data(), block2.data() + block2.size()});
+    ranges.push_back({block3.data(), block3.data() + block3.size()});
+    
+    auto result = sig.scan(ranges);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), reinterpret_cast<uintptr_t>(block2.data()) + 50);
+}
+
+TEST(SignatureTest, ScanMultipleRanges_NotFound) {
+    ur::runtime_signature sig("12 34 56");
+    
+    std::vector<std::byte> block1(100, std::byte{0x00});
+    std::vector<std::byte> block2(100, std::byte{0x00});
+    
+    std::vector<std::pair<const void*, const void*>> ranges;
+    ranges.push_back({block1.data(), block1.data() + block1.size()});
+    ranges.push_back({block2.data(), block2.data() + block2.size()});
+    
+    auto result = sig.scan(ranges);
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST(SignatureTest, ScanMultipleRanges_Empty) {
+    ur::runtime_signature sig("12 34 56");
+    std::vector<std::pair<const void*, const void*>> ranges;
+    auto result = sig.scan(ranges);
+    EXPECT_FALSE(result.has_value());
+}
 // --- Tests for static_signature ---
 
 TEST(StaticSignatureTest, ForwardAnchor_Found) {
